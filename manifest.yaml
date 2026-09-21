@@ -2,7 +2,7 @@ apiVersion: v1  # 请勿修改
 kind: Plugin  # 请勿修改
 metadata:
   # author 和 name 唯一确定一个插件
-  author: Amateur
+  author: DefensiveSniper
   name: BilibiliReminder
   repository: 'https://github.com/DefensiveSniper/BilibiliReminder'
   version: 0.2.0
