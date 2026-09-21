@@ -1,31 +1,72 @@
-apiVersion: v1  # 不要改动
-kind: Plugin  # 不要改动
+apiVersion: v1  # 请勿修改
+kind: Plugin  # 请勿修改
 metadata:
   # author 和 name 唯一确定一个插件
-  author: Amateur  # 插件作者，修改为你的名称
-  name: BilibiliReminder  # 插件名称，修改为你的插件名称
-  repository: 'https://github.com/DefensiveSniper/BilibiliReminder'  # 插件仓库地址，修改为你的插件 GitHub 仓库地址
-  version: 0.1.0  # 插件版本，修改为你的插件版本
-  description:  # 插件简介，修改为你的插件简介，支持多语言
-    en_US: 订阅B站UP主的开播状态信息
-    zh_CN: 订阅B站UP主的开播状态信息
-  label:  # 插件显示名称，支持多语言。在 WebUI 上会显示对应语言的 label
+  author: Amateur
+  name: BilibiliReminder
+  repository: 'https://github.com/DefensiveSniper/BilibiliReminder'
+  version: 0.2.0
+  description:
+    en_US: 'Subscribe to Bilibili streamers and get notified in chat when they go live'
+    zh_Hans: '订阅B站UP主的开播状态信息'
+  label:
     en_US: BilibiliReminder
-    zh_CN: BilibiliReminder
+    zh_Hans: BilibiliReminder
+  icon: assets/icon.svg
 spec:
-  # 插件配置（可选），可配置多项
-  # config:
-  #   - name: github_token  # 配置项名称
-  #     label:  # 配置项显示名称，支持多语言
-  #       en_US: Github Token
-  #       zh_CN: Github Token
-  #     description:  # 配置项描述，支持多语言
-  #       en_US: Image downloading requires a Github token
-  #       zh_CN: 如果不填的话，图片可能会下载失败
-  #     type: string  # 配置项类型，支持 string, integer, float, boolean 等
-  #     default: ''  # 配置项默认值
-  #     required: false  # 配置项是否必填
+  config:
+    - name: check_interval
+      type: integer
+      label:
+        en_US: Check interval (seconds)
+        zh_Hans: 查询间隔（秒）
+      description:
+        en_US: 'How often to poll Bilibili for live status. Values below 15 seconds are clamped to 15.'
+        zh_Hans: '轮询B站直播间状态的间隔，单位为秒。小于 15 秒会被强制为 15 秒。'
+      default: 60
+      required: false
+    - name: default_cover
+      type: string
+      label:
+        en_US: Fallback cover image
+        zh_Hans: 兜底封面图
+      description:
+        en_US: 'Image used in the notification when the streamer has not set a cover.'
+        zh_Hans: 'UP主没有设置直播间封面时，提醒消息里使用的图片。'
+      default: 'https://hzihao.icu/wp-content/uploads/2025/07/cover1_compressed.png'
+      required: false
+    - name: notify_admin
+      type: boolean
+      label:
+        en_US: Notify admin on failure
+        zh_Hans: 出错时通知管理员
+      description:
+        en_US: 'Send a private message to the admin when pushing a reminder fails.'
+        zh_Hans: '推送开播提醒失败时，私聊通知管理员。'
+      default: false
+      required: false
+    - name: admin_id
+      type: string
+      label:
+        en_US: Admin user ID
+        zh_Hans: 管理员账号 ID
+      description:
+        en_US: 'The user ID that receives failure notifications, e.g. the admin QQ number.'
+        zh_Hans: '接收异常通知的账号 ID，例如机器人管理员的 QQ 号。'
+      default: ''
+      required: false
+      show_if:
+        field: notify_admin
+        operator: eq
+        value: true
+  components:
+    Command:
+      fromDirs:
+        - path: components/commands/
+    EventListener:
+      fromDirs:
+        - path: components/event_listener/
 execution:
   python:
-    path: main.py  # 插件主程序路径，必须与上方插件入口代码的文件名相同
-    attr: BilibiliReminder  # 插件类名，必须与上方代码中声明的类名相同
+    path: main.py  # 请勿修改
+    attr: BilibiliReminder  # 请勿修改

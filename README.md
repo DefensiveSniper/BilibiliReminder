@@ -1,38 +1,56 @@
 # BilibiliReminder
 
-<!--
-## 插件开发者详阅
+A LangBot plugin that subscribes to Bilibili live rooms and pushes a reminder to the chat when a streamer goes live.
 
-### 开始
+Built for the LangBot 4.x plugin system. Based on [Hanschase/BreminderPlugin](https://github.com/Hanschase/BreminderPlugin).
 
-此仓库是 LangBot 插件模板，您可以直接在 GitHub 仓库中点击右上角的 "Use this template" 以创建你的插件。  
-接下来按照以下步骤修改模板代码：
+## Features
 
-#### 修改模板代码
+- Subscribe to any Bilibili live room by room ID (short IDs and room URLs work too).
+- Works in both group chats and direct messages. In group chats the reminder `@`s everyone who subscribed to that room.
+- Per-user subscriptions: each member of a group keeps their own list.
+- One batched request per polling round, no matter how many rooms are subscribed.
+- Subscriptions are kept in LangBot plugin storage, scoped to the current installation and workspace.
 
-- 修改此文档顶部插件名称信息
-- 将此文档下方的`<插件发布仓库地址>`改为你的插件在 GitHub 上的地址
-- 补充下方的`使用`章节内
-- 修改`main.py`中的`MyPlugin`类名为你的插件类名
-- 修改`manifest.yaml`中的信息
-- 将插件所需依赖库写到`requirements.txt`中
-- 根据[插件开发教程](https://docs.langbot.app/zh/plugin/dev/tutor.html)编写插件代码
-- 删除 README.md 中的注释内容
+## Installation
 
+Install it from the LangBot plugin marketplace, or see the [plugin installation guide](https://langbot.app/docs/zh/plugin/plugin-intro).
 
-#### 发布插件
+## Usage
 
-推荐将插件上传到 GitHub 代码仓库，以便用户通过下方方式安装。   
-欢迎[提issue](https://github.com/RockChinQ/LangBot/issues/new?assignees=&labels=%E7%8B%AC%E7%AB%8B%E6%8F%92%E4%BB%B6&projects=&template=submit-plugin.yml&title=%5BPlugin%5D%3A+%E8%AF%B7%E6%B1%82%E7%99%BB%E8%AE%B0%E6%96%B0%E6%8F%92%E4%BB%B6)，将您的插件提交到[插件列表](https://github.com/stars/RockChinQ/lists/qchatgpt-%E6%8F%92%E4%BB%B6)
+All commands live under the `sb` command (`!` is the default command prefix):
 
-下方是给用户看的内容，按需修改
--->
+| Command | Description |
+| --- | --- |
+| `!sb` | Show usage |
+| `!sb sub <room_id>` | Subscribe to a live room |
+| `!sb unsub <room_id>` | Unsubscribe from a live room |
+| `!sb rooms` | List the rooms you subscribed to in this chat |
+| `!sb status` | Show the current live status of the rooms you subscribed to |
 
-## 安装
+Example: `!sb sub 21452505`
 
-配置完成 [LangBot](https://github.com/RockChinQ/LangBot) 主程序后即可到插件管理页面安装  
-或查看详细的[插件安装说明](https://docs.langbot.app/plugin/plugin-intro.html#%E6%8F%92%E4%BB%B6%E7%94%A8%E6%B3%95)
+The plugin starts polling automatically when it loads — no command is needed to start it.
 
-## 使用
+## Configuration
 
-<!-- 插件开发者自行填写插件使用说明 -->
+Configure these in the LangBot plugin management page:
+
+| Option | Default | Description |
+| --- | --- | --- |
+| Check interval (seconds) | `60` | How often live status is polled. Values below 15 are clamped to 15. |
+| Fallback cover image | built-in image | Used when the streamer has not set a room cover. |
+| Notify admin on failure | `false` | Send a DM to the admin when pushing a reminder fails. |
+| Admin user ID | empty | Receiver of those failure notifications. |
+
+## Upgrading from 0.1.x
+
+Version 0.2.0 targets the LangBot 4.x plugin system and is not compatible with the old data file:
+
+- Commands changed: `!apply` / `!cancel` / `!rooms` / `!startrem` are replaced by `!sb sub` / `!sb unsub` / `!sb rooms`; polling now starts by itself.
+- Subscriptions are no longer stored in `subscription.json`; the old file is not imported, so subscriptions have to be created again.
+
+## Notes
+
+- All reply texts are in Chinese, and deliberately rude — that is the original plugin's voice.
+- The plugin only reads public Bilibili live room information and does not require a Bilibili account.

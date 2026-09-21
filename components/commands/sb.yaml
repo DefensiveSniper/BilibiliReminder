@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Command
+metadata:
+  name: sb
+  label:
+    en_US: Bilibili Subscription
+    zh_Hans: B站开播订阅
+  description:
+    en_US: 'Manage Bilibili live room subscriptions'
+    zh_Hans: '管理 B 站直播间开播提醒的订阅'
+spec:
+execution:
+  python:
+    path: sb.py
+    attr: Sb

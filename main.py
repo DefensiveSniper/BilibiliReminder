@@ -1,352 +1,224 @@
-from turtle import up
-from pkg.plugin.context import register, handler, llm_func, BasePlugin, APIHost, EventContext
-from pkg.plugin.events import *  # 导入事件类
-from mirai import MessageChain,At,Image
+"""BilibiliReminder：订阅 B 站 UP 主的开播状态，开播时主动推送提醒。
+
+在 https://github.com/Hanschase/BreminderPlugin 的基础上进行的修改。
+"""
+
+from __future__ import annotations
+
 import asyncio
-import os
-import json
-import requests
+import logging
+from collections import OrderedDict
+from typing import Any
 
-# 在https://github.com/Hanschase/BreminderPlugin的基础上进行的修改
+from langbot_plugin.api.definition.plugin import BasePlugin
+from langbot_plugin.api.entities.builtin.platform.message import (
+    At,
+    Image,
+    MessageChain,
+    Plain,
+)
 
-"""查询频率，单位为秒，推荐为60"""
-CHECK_DELAY = 60
-"""发生问题时，是否通知管理员(通知则把ID修改为机器人管理员的QQ)"""
-NOTIFY_ADMIN = False
-ADMIN_ID = None   # int
+from bilireminder.client import LIVE_STATUS_LIVING, BilibiliLiveClient, RoomInfo
+from bilireminder.store import SubscriptionStore, make_session_key
 
-@register(name="BilibiliReminder", description="订阅B站UP主的开播状态信息", version="0.1", author="Amateur")
+logger = logging.getLogger(__name__)
+
+DEFAULT_COVER = "https://hzihao.icu/wp-content/uploads/2025/07/cover1_compressed.png"
+DEFAULT_CHECK_INTERVAL = 60
+MIN_CHECK_INTERVAL = 15
+FIRST_CHECK_DELAY = 5
+SENDER_CACHE_SIZE = 256
+
+
 class BilibiliReminder(BasePlugin):
-    # 插件加载时触发
-    def __init__(self, host: APIHost):
-        # 检测是否存在subscription.json
-        if not os.path.exists("subscription.json"):
-            with open("subscription.json", "w", encoding="utf-8") as f:
-                data = {
-                    "group_ids":[]
-                }
-                '''
-                样例示范：
-                {
-                 "group_ids":[],        # 群号列表
-                 "group_id": {          # 群号
-                     "room_ids": [
-                         "room_id1",
-                         "room_id2"
-                     ],
-                     "person_ids": [
-                         "person_id1",
-                         "person_id2"
-                     ],
-                     "person_id1": {
-                         "up_name1" : "room_id1",
-                         "up_name2" : "room_id2"
-                     },
-                     "room_id": [
-                         "0",           # 房间状态码
-                         "member_id1",
-                         "member_id2"
-                     ]
-                 }
-                 '''
-                json.dump(data, f, indent=4)
+    """插件入口：持有订阅数据、B 站客户端和后台轮询任务。"""
+
+    store: SubscriptionStore
+    client: BilibiliLiveClient
+
+    def __init__(self) -> None:
+        super().__init__()
+        # 请求键 -> 该次命令的真实发送者，由事件监听器写入、命令处理时取走
+        self._senders: OrderedDict[str, str] = OrderedDict()
+
+    async def initialize(self) -> None:
+        self.store = SubscriptionStore(self)
+        await self.store.load()
+        self.client = BilibiliLiveClient()
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        logger.info(
+            "BilibiliReminder 已启动，开播查询间隔 %d 秒", self.check_interval
+        )
+
+    def __del__(self) -> None:
+        task = getattr(self, "_poll_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    # ------------------------------------------------------------------
+    # 命令发送者
+    # ------------------------------------------------------------------
+
+    def remember_sender(self, query_key: str, sender_id: str) -> None:
+        """记录某次请求的真实发送者，见 bilireminder/sender.py。"""
+        if not query_key or not sender_id:
+            return
+        self._senders[query_key] = str(sender_id)
+        self._senders.move_to_end(query_key)
+        # 命令若被其他插件拦截就不会有人来取，这里按容量淘汰，避免无限增长
+        while len(self._senders) > SENDER_CACHE_SIZE:
+            self._senders.popitem(last=False)
+
+    def pop_sender(self, query_key: str) -> str | None:
+        return self._senders.pop(query_key, None)
+
+    # ------------------------------------------------------------------
+    # 配置项
+    # ------------------------------------------------------------------
+
+    @property
+    def _config(self) -> dict[str, Any]:
         try:
-            with open("subscription.json", "r", encoding="utf-8") as f:
-                self.subscription = json.load(f)
-        except json.JSONDecodeError:
-            self.ap.logger.error("subscription.json decoding failed")
-            print("subscription.json decoding failed")
+            return self.get_config() or {}
+        except Exception:
+            return {}
 
-    # 异步初始化
-    async def initialize(self):
-        pass
-    # 写入json
-    def write_json(self):
-        with open("subscription.json", "w", encoding="utf-8") as f:
-            json.dump(self.subscription, f, indent=4)
+    @property
+    def check_interval(self) -> int:
+        """查询频率，单位为秒。过小的间隔容易被 B 站限流，因此有下限。"""
+        try:
+            interval = int(self._config.get("check_interval") or DEFAULT_CHECK_INTERVAL)
+        except (TypeError, ValueError):
+            interval = DEFAULT_CHECK_INTERVAL
+        return max(interval, MIN_CHECK_INTERVAL)
 
-    # 执行任务
-    async def run(self, ctx:EventContext):
+    @property
+    def default_cover(self) -> str:
+        """UP 主没设置封面时使用的兜底图片。"""
+        return str(self._config.get("default_cover") or "").strip() or DEFAULT_COVER
+
+    @property
+    def notify_admin(self) -> bool:
+        """发生问题时是否通知管理员。"""
+        return bool(self._config.get("notify_admin"))
+
+    @property
+    def admin_id(self) -> str:
+        return str(self._config.get("admin_id") or "").strip()
+
+    # ------------------------------------------------------------------
+    # 后台轮询
+    # ------------------------------------------------------------------
+
+    async def _poll_loop(self) -> None:
+        await asyncio.sleep(FIRST_CHECK_DELAY)
         while True:
-            for group_id in self.subscription["group_ids"]:
-                for room_id in self.subscription[group_id]["room_ids"]:
-                    if int(self.subscription[group_id][room_id][0]) == 0:  # 上一时段状态为未开播时
-                        live_status = self.check_room_live(room_id)
-                        if live_status == 1:
-                            self.subscription[group_id][room_id][0] = 1 # 修改开播状态
-                            await self.notify_person(group_id,room_id,ctx) # 通知群友
-                    elif int(self.subscription[group_id][room_id][0]) == 1:  # 上一时段为开播时
-                        live_status = self.check_room_live(room_id)
-                        if live_status == 0:
-                            self.subscription[group_id][room_id][0] = 0  # 修改未开播状态
-                        elif live_status == 2: # 增加轮播状态
-                            self.subscription[group_id][room_id][0] = 0  # 修改未开播状态
-                    else:
-                        if NOTIFY_ADMIN:
-                            await ctx.send_message("person",ADMIN_ID,[f"直播间通知插件出了点问题，去看看后台,房间号{room_id},群号：{group_id}，状态码：{self.subscription[group_id][room_id][0]}"])
-                    self.write_json()
-            await asyncio.sleep(CHECK_DELAY)
-
-    # 通知群友
-    async def notify_person(self,group_id,room_id,ctx:EventContext):  # 一直在重复请求，不知道会不会被ban，出问题再说
-        API = f'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?room_ids={room_id}&req_biz=video'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
-        try:
-            response = requests.get(API, headers=headers)
-            response.raise_for_status()  # 如果请求返回错误状态码，会引发异常
-            data = response.json()
-            room_id_real = next(iter(data["data"]["by_room_ids"]))  # 真实房间号
-            room_cover = data["data"]["by_room_ids"][room_id_real]["cover"]   # 封面
-            room_title = data["data"]["by_room_ids"][room_id_real]["title"]   # 直播间标题
-            up_name = data["data"]["by_room_ids"][room_id_real]["uname"]      # UP主
-            room_url = data["data"]["by_room_ids"][room_id_real]["live_url"]  # 直播间地址
-            atperson = MessageChain()
-
-            # 防止懒狗没设置封面报错
-            if room_cover == "":
-                room_cover = "https://hzihao.icu/wp-content/uploads/2025/07/cover1_compressed.png"
-            
-            for person_id in self.subscription[group_id][room_id][1:]:  # 排除状态码
-                atperson.append(At(int(person_id)))
-            await ctx.send_message("group",int(group_id),atperson + MessageChain([
-                f"\n您订阅的直播间开播啦！",
-                Image(url=room_cover),
-                f"直播间标题：{room_title}",
-                f"\nUP主：{up_name}",
-                f"\n直播间地址：{room_url}"
-            ]))
-            if NOTIFY_ADMIN:
-                await ctx.send_message("person", int(ADMIN_ID),[f"朝{group_id}的{atperson}发送了订阅信息"])
-            self.ap.logger.info(f"朝{group_id}的{atperson}发送了订阅信息")
-        except Exception as e:
-            self.ap.logger.error(f"在调用notify_person函数时，发生错误：{e}")
-
-    # 查询直播间状态
-    def check_room_live(self,room_id):
-        API = f'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?room_ids={room_id}&req_biz=video'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
-        try:
-            response = requests.get(API, headers=headers)
-            response.raise_for_status()  # 如果请求返回错误状态码，会引发异常
-            data = response.json()
-            room_id_real = next(iter(data["data"]["by_room_ids"]))  # 真实房间号
-            live_status = int(data["data"]["by_room_ids"][room_id_real]["live_status"])
-            return live_status
-        except Exception as e:
-            self.ap.logger.error(f"在调用check_room_live函数时，访问URL失败，发生错误：{e}")
-            return -400  # 400：Bad Request
-
-    # 检查B站直播间是否存在
-    def check_if_exit(self, room_id):
-        API = f'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?room_ids={room_id}&req_biz=video'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
-        try:
-            response = requests.get(API, headers=headers)
-            response.raise_for_status()  # 如果请求返回错误状态码，会引发异常
-            data = response.json()
-            code = data['code']
-        except Exception as e:
-            self.ap.logger.error(f"在调用check_if_exit函数时，访问URL失败，发生错误：{e}")
-            return e
-        return code
-
-    # 获取UP主名称
-    def get_up_name(self,room_id):
-        API = f'https://api.live.bilibili.com/xlive/web-room/v1/index/getRoomBaseInfo?room_ids={room_id}&req_biz=video'
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": f"https://live.bilibili.com/{room_id}",
-        }
-        try:
-            response = requests.get(API, headers=headers)
-            response.raise_for_status()  # 如果请求返回错误状态码，会引发异常
-            data = response.json()
-            code = data['code']
-            room_id_real = next(iter(data["data"]["by_room_ids"]))  # 真实房间号
-            up_name = data["data"]["by_room_ids"][room_id_real]["uname"]      # UP主
-            return up_name
-        except Exception as e:
-            self.ap.logger.error(f"在调用get_up_name函数时，访问URL失败，发生错误：{e}")
-            return code
-    
-    # 检查是否已经注册提醒
-    def check_if_apply(self,group_id,person_id,room_id):
-        # 检查群组是否存在
-        if group_id not in self.subscription["group_ids"]:
-            return False
-        
-        # 检查person_id是否在person_ids列表中
-        if "person_ids" not in self.subscription[group_id] or person_id not in self.subscription[group_id]["person_ids"]:
-            return False
-        
-        # 检查person_id的字典中是否有任何up_name对应这个room_id
-        if person_id in self.subscription[group_id] and isinstance(self.subscription[group_id][person_id], dict):
-            for up_name, stored_room_id in self.subscription[group_id][person_id].items():
-                if stored_room_id == room_id:
-                    return True
-        return False
-
-    # 写入注册信息
-    def apply_sub(self,group_id,person_id,room_id):
-        up_name = self.get_up_name(room_id)
-        
-        # 初始化群组结构
-        if group_id not in self.subscription["group_ids"]:
-            self.subscription["group_ids"].append(group_id)
-            self.subscription[group_id] = {
-                "room_ids": [],
-                "person_ids": []
-            }
-        
-        # 确保基础结构存在
-        if "room_ids" not in self.subscription[group_id]:
-            self.subscription[group_id]["room_ids"] = []
-        if "person_ids" not in self.subscription[group_id]:
-            self.subscription[group_id]["person_ids"] = []
-        
-        # 添加person_id到person_ids列表（如果不存在）
-        if person_id not in self.subscription[group_id]["person_ids"]:
-            self.subscription[group_id]["person_ids"].append(person_id)
-        
-        # 确保person_id的字典存在
-        if person_id not in self.subscription[group_id]:
-            self.subscription[group_id][person_id] = {}
-        
-        # 添加up_name到person_id的字典中，格式为 {"up_name": "room_id"}
-        self.subscription[group_id][person_id][up_name] = room_id
-        
-        # 处理room_id相关逻辑
-        if room_id not in self.subscription[group_id]["room_ids"]:
-            self.subscription[group_id]["room_ids"].append(room_id)
-        
-        # 初始化或更新room_id的订阅者列表
-        if room_id not in self.subscription[group_id]:
-            self.subscription[group_id][room_id] = ["0"]  # 第一个元素是状态码
-        
-        # 添加person_id到room_id的订阅者列表（如果不存在）
-        if person_id not in self.subscription[group_id][room_id]:
-            self.subscription[group_id][room_id].append(person_id)
-        
-        self.write_json()
-
-    # 开始监控信息
-    @handler(GroupCommandSent)
-    async def cmd_run(self, ctx: EventContext):
-        command = ctx.event.command
-        if command == "startrem":
-            ctx.prevent_default()
-            ctx.prevent_postorder()
-            if hasattr(self, 'run_task') and not self.run_task.done():
-                await ctx.reply(["订阅任务已经开始执行了哦~"])
-                return
             try:
-                self.run_task = asyncio.create_task(self.run(ctx))
-                await ctx.reply(["订阅任务开始执行"])
-            except Exception as e:
-                self.ap.logger.error(f"Error starting task: {e}")
-        elif command == "rooms":
-            self.ap.logger.info(f"执行rooms命令")
-            group_id = str(ctx.event.launcher_id)
-            person_id = str(ctx.event.sender_id)
-            ctx.prevent_default()
-            ctx.prevent_postorder()
-            
-            # 检查群组是否存在
-            if group_id not in self.subscription["group_ids"]:
-                await ctx.reply([At(int(ctx.event.sender_id)), "你订阅了个蛋？没订阅你瞎发什么？"])
-                return
-            
-            # 检查person_id是否在person_ids列表中
-            if "person_ids" not in self.subscription[group_id] or person_id not in self.subscription[group_id]["person_ids"]:
-                await ctx.reply([At(int(ctx.event.sender_id)), "你订阅了个蛋？没订阅你瞎发什么？"])
-                return
-            
-            # 从person_id的字典中获取订阅的UP主和房间信息
-            up_room_list = []
-            if person_id in self.subscription[group_id] and isinstance(self.subscription[group_id][person_id], dict):
-                for up_name, room_id in self.subscription[group_id][person_id].items():
-                    up_room_list.append(f"{up_name}({room_id})")
-            
-            if up_room_list:
-                await ctx.reply([At(int(ctx.event.sender_id)), f"傻呗吗你？这你都能忘？给大伙看看你的爹爹们：<{', '.join(up_room_list)}>"]) 
-            else:
-                await ctx.reply([At(int(ctx.event.sender_id)), "你订阅了个蛋？没订阅你瞎发什么？"])
-        elif command == "apply":
-            self.ap.logger.info(f"执行apply命令")
-            group_id = str(ctx.event.launcher_id)
-            person_id = str(ctx.event.sender_id)
-            room_id = ctx.event.text_message.split()[1]
-            ctx.prevent_default()
-            ctx.prevent_postorder()
-            code = self.check_if_exit(room_id)
-            if code == -400:
-                await ctx.reply([At(int(ctx.event.sender_id)),"你没长眼睛吗？房间号对错不知道吗？"])
-            elif code == 0:
-                if self.check_if_apply(group_id,person_id,room_id):
-                    await ctx.reply([At(int(ctx.event.sender_id)), f"你已经注册过B站直播间号[{room_id}],你再注册试试？"])
-                else:
-                    await ctx.reply([At(int(ctx.event.sender_id)), f"成功订阅B站直播间号[{room_id}],在开播时我会哈你"])
-                    self.apply_sub(group_id,person_id,room_id)
-            else:
-                await ctx.reply([At(int(ctx.event.sender_id)), f"抱歉,订阅直播间发生了一个错误：{code}，请联系管理员"])
-        elif command == "cancel":
-            self.ap.logger.info(f"执行cancel命令")
-            group_id = str(ctx.event.launcher_id)
-            person_id = str(ctx.event.sender_id)
-            room_id = ctx.event.text_message.split()[1]
-            ctx.prevent_default()
-            ctx.prevent_postorder()
-            
-            if self.check_if_apply(group_id, person_id, room_id):  # 如果订阅了就开始逐层删除
-                # 获取要取消订阅的UP主名称
-                up_name = self.get_up_name(room_id)
-                
-                # 从room_id的订阅者列表中删除person_id
-                if room_id in self.subscription[group_id] and person_id in self.subscription[group_id][room_id]:
-                    self.subscription[group_id][room_id].remove(person_id)
-                
-                # 从person_id的字典中删除对应的up_name
-                if person_id in self.subscription[group_id] and isinstance(self.subscription[group_id][person_id], dict):
-                    if up_name in self.subscription[group_id][person_id]:
-                        del self.subscription[group_id][person_id][up_name]
-                
-                # 如果person_id的字典为空，从person_ids列表中删除该person_id
-                if person_id in self.subscription[group_id] and len(self.subscription[group_id][person_id]) == 0:
-                    if "person_ids" in self.subscription[group_id] and person_id in self.subscription[group_id]["person_ids"]:
-                        self.subscription[group_id]["person_ids"].remove(person_id)
-                    del self.subscription[group_id][person_id]
-                
-                # 房间清理逻辑：如果只剩状态码，删除房间
-                if room_id in self.subscription[group_id] and len(self.subscription[group_id][room_id]) == 1:  # 如果只剩状态码
-                    del self.subscription[group_id][room_id]
-                    if "room_ids" in self.subscription[group_id] and room_id in self.subscription[group_id]["room_ids"]:
-                        self.subscription[group_id]["room_ids"].remove(room_id)
-                
-                # 群组清理逻辑：如果该群号没有订阅房间，删除群组
-                if "room_ids" in self.subscription[group_id] and len(self.subscription[group_id]["room_ids"]) == 0:
-                    del self.subscription[group_id]
-                    if group_id in self.subscription["group_ids"]:
-                        self.subscription["group_ids"].remove(group_id)
-                
-                await ctx.reply([At(int(ctx.event.sender_id)), f"不看你爹<{up_name}>就滚"])
-                self.write_json()
-            else:
-                up_name = self.get_up_name(room_id)
-                await ctx.reply([At(int(ctx.event.sender_id)), f"你™订阅你爹<{up_name}>了吗？你就取消，再发给你卤煮扬了！"])
+                await self.check_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("轮询直播间状态时发生未预期的错误")
+            await asyncio.sleep(self.check_interval)
 
-    # 插件卸载时触发
-    def __del__(self):
-        pass
+    async def check_once(self) -> None:
+        """查询一轮所有被订阅的直播间，并对新开播的直播间推送提醒。"""
+        sessions = await self.store.snapshot()
+        room_ids = {room_id for session in sessions for room_id in session["rooms"]}
+        if not room_ids:
+            return
+
+        infos = await self.client.fetch_rooms(sorted(room_ids))
+        if not infos:
+            logger.warning("本轮未能查询到任何直播间信息，跳过本次检查")
+            return
+
+        for session in sessions:
+            session_key = make_session_key(
+                session["bot_uuid"], session["target_type"], session["target_id"]
+            )
+            for room_id, room in session["rooms"].items():
+                info = infos.get(room_id)
+                if info is None:
+                    logger.warning("未查询到直播间 %s 的信息，本轮跳过", room_id)
+                    continue
+
+                previous_status = int(room.get("live_status") or 0)
+                await self.store.update_room(
+                    session_key=session_key,
+                    room_id=room_id,
+                    live_status=info.live_status,
+                    up_name=info.up_name,
+                )
+
+                # 只在「此前不在直播中」变为「直播中」时提醒，轮播结束后再开播同样会提醒
+                if previous_status != LIVE_STATUS_LIVING and info.is_living:
+                    await self._notify(session, room, info)
+
+    async def _notify(
+        self, session: dict[str, Any], room: dict[str, Any], info: RoomInfo
+    ) -> None:
+        """向订阅了该直播间的会话推送开播提醒。"""
+        target_type = session["target_type"]
+        target_id = session["target_id"]
+        bot_uuid = session["bot_uuid"]
+
+        components: list[Any] = []
+        if target_type == "group":
+            # 私聊消息本来就只发给订阅者本人，只有群聊需要 @ 出来
+            components.extend(
+                At(target=subscriber) for subscriber in room["subscribers"]
+            )
+        components.extend(
+            [
+                Plain(text="\n您订阅的直播间开播啦！"),
+                Image(url=info.cover or self.default_cover),
+                Plain(
+                    text=(
+                        f"直播间标题：{info.title}"
+                        f"\nUP主：{info.up_name}"
+                        f"\n直播间地址：{info.live_url}"
+                    )
+                ),
+            ]
+        )
+
+        try:
+            await self.send_message(
+                bot_uuid=bot_uuid,
+                target_type=target_type,
+                target_id=str(target_id),
+                message_chain=MessageChain(components),
+            )
+        except Exception as e:
+            logger.exception(
+                "向 %s %s 推送直播间 %s 的开播提醒失败", target_type, target_id, info.room_id
+            )
+            await self.notify_admin_if_needed(
+                bot_uuid,
+                f"直播间通知插件出了点问题，去看看后台，"
+                f"房间号：{info.room_id}，会话：{target_type}_{target_id}，错误：{e}",
+            )
+            return
+
+        logger.info(
+            "已向 %s %s 推送 %s（房间号 %s）的开播提醒",
+            target_type,
+            target_id,
+            info.up_name,
+            info.room_id,
+        )
+
+    async def notify_admin_if_needed(self, bot_uuid: str, text: str) -> None:
+        """在配置开启时，把异常信息私聊发给管理员。"""
+        if not self.notify_admin or not self.admin_id or not bot_uuid:
+            return
+        try:
+            await self.send_message(
+                bot_uuid=bot_uuid,
+                target_type="person",
+                target_id=self.admin_id,
+                message_chain=MessageChain([Plain(text=text)]),
+            )
+        except Exception:
+            logger.exception("通知管理员 %s 失败", self.admin_id)
