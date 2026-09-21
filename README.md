@@ -39,7 +39,7 @@ Configure these in the LangBot plugin management page:
 | Option | Default | Description |
 | --- | --- | --- |
 | Check interval (seconds) | `60` | How often live status is polled. Values below 15 are clamped to 15. |
-| Fallback cover image | empty | Used when the streamer has not set a room cover. Leave empty to send the reminder without an image. |
+| Fallback cover image | empty | Image URL used when the streamer has not set a room cover. Leave empty to use the image bundled with the plugin (`assets/default_cover.png`). |
 | Notify admin on failure | `false` | Send a DM to the admin when pushing a reminder fails. |
 | Admin user ID | empty | Receiver of those failure notifications. |
 

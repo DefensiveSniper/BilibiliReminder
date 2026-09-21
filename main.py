@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import pathlib
 from collections import OrderedDict
 from typing import Any
 
@@ -23,6 +25,7 @@ from bilireminder.store import SubscriptionStore, make_session_key
 
 logger = logging.getLogger(__name__)
 
+BUNDLED_COVER_PATH = pathlib.Path(__file__).parent / "assets" / "default_cover.png"
 DEFAULT_CHECK_INTERVAL = 60
 MIN_CHECK_INTERVAL = 15
 FIRST_CHECK_DELAY = 5
@@ -39,6 +42,7 @@ class BilibiliReminder(BasePlugin):
         super().__init__()
         # 请求键 -> 该次命令的真实发送者，由事件监听器写入、命令处理时取走
         self._senders: OrderedDict[str, str] = OrderedDict()
+        self._bundled_cover: str | None = None
 
     async def initialize(self) -> None:
         self.store = SubscriptionStore(self)
@@ -93,8 +97,23 @@ class BilibiliReminder(BasePlugin):
 
     @property
     def default_cover(self) -> str:
-        """UP 主没设置封面时使用的兜底图片，留空表示不附图片。"""
+        """UP 主没设置封面时使用的兜底图片，留空则使用插件自带的那张。"""
         return str(self._config.get("default_cover") or "").strip()
+
+    def bundled_cover(self) -> str:
+        """插件自带的兜底封面，以 base64 随消息发送。
+
+        不走图床或仓库 raw 链接：前者会依赖第三方站点，后者在国内网络下经常拉不动，
+        而图片本身就打包在插件里，直接带上最稳。读一次缓存住。
+        """
+        if self._bundled_cover is None:
+            try:
+                encoded = base64.b64encode(BUNDLED_COVER_PATH.read_bytes()).decode()
+                self._bundled_cover = f"data:image/png;base64,{encoded}"
+            except Exception:
+                logger.exception("读取自带封面 %s 失败，开播提醒将不附图片", BUNDLED_COVER_PATH)
+                self._bundled_cover = ""
+        return self._bundled_cover
 
     @property
     def notify_admin(self) -> bool:
@@ -170,10 +189,12 @@ class BilibiliReminder(BasePlugin):
             )
         components.append(Plain(text="\n您订阅的直播间开播啦！"))
 
-        # UP 主没设封面、用户也没配兜底图时就只发文字，不附一张必定加载失败的图
+        # 优先用直播间封面，其次用户配的兜底图，最后退回插件自带的那张
         cover = info.cover or self.default_cover
         if cover:
             components.append(Image(url=cover))
+        elif self.bundled_cover():
+            components.append(Image(base64=self.bundled_cover()))
 
         components.append(
             Plain(

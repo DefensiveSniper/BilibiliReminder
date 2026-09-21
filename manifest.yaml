@@ -31,8 +31,8 @@ spec:
         en_US: Fallback cover image
         zh_Hans: 兜底封面图
       description:
-        en_US: 'Image used in the notification when the streamer has not set a cover. Leave empty to send no image.'
-        zh_Hans: 'UP主没有设置直播间封面时，提醒消息里使用的图片。留空则不附图片。'
+        en_US: 'Image used in the notification when the streamer has not set a cover. Leave empty to use the image bundled with the plugin.'
+        zh_Hans: 'UP主没有设置直播间封面时，提醒消息里使用的图片。留空则使用插件自带的那张。'
       default: ''
       required: false
     - name: notify_admin
