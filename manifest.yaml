@@ -5,7 +5,7 @@ metadata:
   author: DefensiveSniper
   name: BilibiliReminder
   repository: 'https://github.com/DefensiveSniper/BilibiliReminder'
-  version: 0.2.0
+  version: 0.2.1
   description:
     en_US: 'Subscribe to Bilibili streamers and get notified in chat when they go live'
     zh_Hans: '订阅B站UP主的开播状态信息'
@@ -31,9 +31,9 @@ spec:
         en_US: Fallback cover image
         zh_Hans: 兜底封面图
       description:
-        en_US: 'Image used in the notification when the streamer has not set a cover.'
-        zh_Hans: 'UP主没有设置直播间封面时，提醒消息里使用的图片。'
-      default: 'https://hzihao.icu/wp-content/uploads/2025/07/cover1_compressed.png'
+        en_US: 'Image used in the notification when the streamer has not set a cover. Leave empty to send no image.'
+        zh_Hans: 'UP主没有设置直播间封面时，提醒消息里使用的图片。留空则不附图片。'
+      default: ''
       required: false
     - name: notify_admin
       type: boolean

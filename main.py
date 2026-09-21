@@ -23,7 +23,6 @@ from bilireminder.store import SubscriptionStore, make_session_key
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COVER = "https://hzihao.icu/wp-content/uploads/2025/07/cover1_compressed.png"
 DEFAULT_CHECK_INTERVAL = 60
 MIN_CHECK_INTERVAL = 15
 FIRST_CHECK_DELAY = 5
@@ -94,8 +93,8 @@ class BilibiliReminder(BasePlugin):
 
     @property
     def default_cover(self) -> str:
-        """UP 主没设置封面时使用的兜底图片。"""
-        return str(self._config.get("default_cover") or "").strip() or DEFAULT_COVER
+        """UP 主没设置封面时使用的兜底图片，留空表示不附图片。"""
+        return str(self._config.get("default_cover") or "").strip()
 
     @property
     def notify_admin(self) -> bool:
@@ -169,18 +168,21 @@ class BilibiliReminder(BasePlugin):
             components.extend(
                 At(target=subscriber) for subscriber in room["subscribers"]
             )
-        components.extend(
-            [
-                Plain(text="\n您订阅的直播间开播啦！"),
-                Image(url=info.cover or self.default_cover),
-                Plain(
-                    text=(
-                        f"直播间标题：{info.title}"
-                        f"\nUP主：{info.up_name}"
-                        f"\n直播间地址：{info.live_url}"
-                    )
-                ),
-            ]
+        components.append(Plain(text="\n您订阅的直播间开播啦！"))
+
+        # UP 主没设封面、用户也没配兜底图时就只发文字，不附一张必定加载失败的图
+        cover = info.cover or self.default_cover
+        if cover:
+            components.append(Image(url=cover))
+
+        components.append(
+            Plain(
+                text=(
+                    f"直播间标题：{info.title}"
+                    f"\nUP主：{info.up_name}"
+                    f"\n直播间地址：{info.live_url}"
+                )
+            )
         )
 
         try:
